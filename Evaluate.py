@@ -6,12 +6,15 @@ from scipy.linalg import sqrtm
 import numpy as np
 import scipy.stats as ss
 from sklearn.metrics import auc
+import Models
+import time
+import datetime
 
 inception_model = tf.keras.applications.InceptionV3(weights='imagenet', pooling='avg', include_top=False)
 
 
 @tf.function
-def _get_feature_samples(decoder: kr.Model, real_images, latent_scale_vector):
+def _get_feature_samples(decoder: kr.Model, latent_scale_vector, real_images):
     batch_size = real_images.shape[0]
     latent_vectors = hp.latent_dist_func(batch_size)
 
@@ -29,12 +32,12 @@ def _get_feature_samples(decoder: kr.Model, real_images, latent_scale_vector):
     return real_features, fake_features
 
 
-def _get_features(decoder: kr.Model, test_dataset: tf.data.Dataset, latent_scale_vector):
+def _get_features(decoder: kr.Model, latent_scale_vector, test_dataset: tf.data.Dataset):
     real_features = []
     fake_features = []
 
     for data in test_dataset:
-        real_features_batch, fake_features_batch = _get_feature_samples(decoder, data['image'], latent_scale_vector)
+        real_features_batch, fake_features_batch = _get_feature_samples(decoder, latent_scale_vector, data['image'])
         real_features.append(real_features_batch)
         fake_features.append(fake_features_batch)
 
@@ -44,8 +47,8 @@ def _get_features(decoder: kr.Model, test_dataset: tf.data.Dataset, latent_scale
     return real_features, fake_features
 
 
-def get_fid(decoder: kr.Model, test_dataset: tf.data.Dataset, latent_scale_vector):
-    real_features, fake_features = _get_features(decoder, test_dataset, latent_scale_vector)
+def get_fid(decoder: kr.Model, latent_scale_vector, test_dataset: tf.data.Dataset):
+    real_features, fake_features = _get_features(decoder, latent_scale_vector, test_dataset)
     real_features_mean = tf.reduce_mean(real_features, axis=0)
     fake_features_mean = tf.reduce_mean(fake_features, axis=0)
 
@@ -63,10 +66,10 @@ def get_fid(decoder: kr.Model, test_dataset: tf.data.Dataset, latent_scale_vecto
     return fid
 
 
-def evaluate_fake_rec(encoder: kr.Model, decoder: kr.Model, test_dataset: tf.data.Dataset, latent_scale_vector):
+def evaluate_fake_rec(encoder: kr.Model, decoder: kr.Model, latent_scale_vector, id_dataset: tf.data.Dataset):
     average_psnr = []
     average_ssim = []
-    for _ in test_dataset:
+    for _ in id_dataset:
         latent_vectors = hp.latent_dist_func(hp.batch_size)
         fake_images = tf.clip_by_value(
             decoder(latent_vectors * latent_scale_vector[tf.newaxis]),
@@ -83,10 +86,10 @@ def evaluate_fake_rec(encoder: kr.Model, decoder: kr.Model, test_dataset: tf.dat
     return tf.reduce_mean(average_psnr), tf.reduce_mean(average_ssim)
 
 
-def evaluate_real_rec(encoder: kr.Model, decoder: kr.Model, test_dataset: tf.data.Dataset, latent_scale_vector):
+def evaluate_real_rec(encoder: kr.Model, decoder: kr.Model, latent_scale_vector, id_dataset: tf.data.Dataset):
     average_psnr = []
     average_ssim = []
-    for data in test_dataset:
+    for data in id_dataset:
         real_images = data['image']
         _, rec_latent_vectors = encoder(real_images)
         rec_images = tf.clip_by_value(
@@ -99,10 +102,10 @@ def evaluate_real_rec(encoder: kr.Model, decoder: kr.Model, test_dataset: tf.dat
     return tf.reduce_mean(average_psnr), tf.reduce_mean(average_ssim)
 
 
-def get_accuracy(encoder: kr.Model, svm: kr.Model, test_dataset: tf.data.Dataset):
+def get_accuracy(encoder: kr.Model, svm: kr.Model, id_dataset: tf.data.Dataset):
     total_count = 0
     wrong_count = 0
-    for data in test_dataset:
+    for data in id_dataset:
         real_labels = tf.argmax(data['label'], axis=-1)
         predict_labels = tf.argmax(svm(encoder(data['image'])[1]), axis=-1)
 
@@ -115,7 +118,7 @@ def get_accuracy(encoder: kr.Model, svm: kr.Model, test_dataset: tf.data.Dataset
     return (total_count - wrong_count) / total_count
 
 
-def get_anodlsgan_ood_scores(encoder: kr.Model, test_dataset: tf.data.Dataset, var_trace):
+def get_nll_ood_scores(encoder: kr.Model, latent_var_trace, test_dataset: tf.data.Dataset):
     scores = []
     for data in test_dataset:
         real_images = data['image']
@@ -123,81 +126,126 @@ def get_anodlsgan_ood_scores(encoder: kr.Model, test_dataset: tf.data.Dataset, v
         _, rec_latent_vectors = encoder(real_images)
 
         for i in range(batch_size):
-            log_probs = -tf.math.log(tf.cast(ss.norm.pdf(rec_latent_vectors[i], scale=tf.sqrt(var_trace)), 'float32'))
+            log_probs = -tf.math.log(tf.cast(ss.norm.pdf(rec_latent_vectors[i], scale=tf.sqrt(latent_var_trace)), 'float32'))
             scores.append(tf.reduce_sum(log_probs))
 
     return tf.convert_to_tensor(scores)
 
 
-def get_inv_cov_feature_mean(encoder: kr.Model, train_dataset: tf.data.Dataset):
-    feature_vectors = []
-    for data in train_dataset:
-        feature_vectors.append(encoder(data['image'])[1])
-
-    feature_vectors = tf.concat(feature_vectors, axis=0)
-    inv_cov = tf.linalg.inv(tfp.stats.covariance(feature_vectors))
-    feature_mean = tf.reduce_mean(feature_vectors, axis=0, keepdims=True)
-
-    return inv_cov, feature_mean
-
-
-def get_mahalanobis_ood_scores(encoder: kr.Model, inv_cov, feature_mean, test_dataset: tf.data.Dataset):
+def get_energy_ood_scores(feature_vectors_set, svm: kr.Model, temperature, activation_threshold):
     scores_sets = []
-    for data in test_dataset:
-        _, feature_vectors = encoder(data['image'])
-
-        scores = tf.matmul(tf.matmul((feature_vectors - feature_mean), inv_cov), tf.transpose(feature_vectors - feature_mean))
-        scores = tf.linalg.diag_part(scores)
+    for feature_vectors in feature_vectors_set:
+        logits = svm(tf.math.minimum(feature_vectors, activation_threshold))
+        scores = -temperature * tf.math.log(tf.reduce_sum(tf.exp(logits / temperature), axis=-1))
         scores_sets.append(scores)
 
     return tf.concat(scores_sets, axis=0)
 
 
-def get_energy_ood_scores(encoder: kr.Model, svm: kr.Model, test_dataset):
-    latent_vectors_set = [encoder(data['image'])[1] for data in test_dataset]
-    latent_values = tf.reshape(tf.concat(latent_vectors_set, axis=0), [-1])
-    latent_values = tf.sort(latent_values)
-    activation_threshold = latent_values[round((latent_values.shape[0] - 1) * hp.react_p)]
-
-    scores_sets = []
-    for latent_vectors in latent_vectors_set:
-        logits = svm(tf.math.minimum(latent_vectors, activation_threshold))
-        scores = -hp.temperature * tf.math.log(tf.reduce_sum(tf.exp(logits / hp.temperature), axis=-1))
-        scores_sets.append(scores)
-
-    return tf.concat(scores_sets, axis=0)
-
-
-def get_rec_ood_scores(encoder: kr.Model, decoder: kr.Model, dataset: tf.data.Dataset):
+def get_rec_ood_scores(encoder: kr.Model, decoder: kr.Model, latent_scale_vector, dataset: tf.data.Dataset):
     scores_sets = []
     for data in dataset:
         real_images = data['image']
-        rec_images = decoder(encoder(real_images)[1])
-        scores = tf.sqrt(tf.reduce_sum(tf.square(real_images - rec_images), axis=[1, 2, 3]))
+        rec_images = decoder(encoder(real_images)[1] * latent_scale_vector[tf.newaxis])
+        scores = tf.reduce_mean(tf.square(real_images - rec_images), axis=[1, 2, 3])
         scores_sets.append(scores)
 
     return tf.concat(scores_sets, axis=0)
 
 
-def get_aurocs(in_ood_scores, out_ood_scores_sets):
-    aurocs = []
-    for out_ood_scores in out_ood_scores_sets:
-        fprs = [0.0]
-        tprs = [0.0]
+def get_auroc(id_ood_scores, ood_ood_scores):
+    fprs = []
+    tprs = []
 
-        ood_thresholds = np.linspace(np.max(in_ood_scores) + 1e-6, np.min(in_ood_scores) - 1e-6, 1000)
+    ood_thresholds = np.linspace(np.max(id_ood_scores) + 1e-6, np.min(id_ood_scores) - 1e-6, 1000)
+    for ood_threshold in ood_thresholds:
+        fprs.append(tf.cast(tf.math.count_nonzero(tf.where(id_ood_scores > ood_threshold, 1.0, 0.0)), 'float32') / id_ood_scores.shape[0])
+        tprs.append(tf.cast(tf.math.count_nonzero(tf.where(ood_ood_scores > ood_threshold, 1.0, 0.0)), 'float32') / ood_ood_scores.shape[0])
 
-        for ood_threshold in ood_thresholds:
-            in_ood_num = tf.math.count_nonzero(tf.where(in_ood_scores > ood_threshold, 1.0, 0.0))
-            fpr = in_ood_num / in_ood_scores.shape[0]
-            fprs.append(fpr)
+    return auc(fprs, tprs)
 
-            out_ood_num = tf.math.count_nonzero(tf.where(out_ood_scores > ood_threshold, 1.0, 0.0))
-            tpr = out_ood_num / out_ood_scores.shape[0]
-            tprs.append(tpr)
-        fprs.append(1.0)
-        tprs.append(1.0)
 
-        aurocs.append(auc(fprs, tprs))
+def evaluate_gan(encoder: Models.Encoder, decoder: Models.Decoder, id_dataset, ood_datasets):
+    results = {}
+    if hp.is_dls:
+        latent_scale_vector = tf.sqrt(tf.cast(hp.latent_vector_dim, dtype='float32')
+                                      * decoder.latent_var_trace / tf.reduce_sum(decoder.latent_var_trace))
+    else:
+        latent_scale_vector = tf.ones([hp.latent_vector_dim])
+    fake_psnr, fake_ssim = evaluate_fake_rec(encoder.model, decoder.model, latent_scale_vector, id_dataset)
+    results['fake_psnr'] = fake_psnr
+    results['fake_ssim'] = fake_ssim
 
-    return aurocs
+    real_psnr, real_ssim = evaluate_real_rec(encoder.model, decoder.model, latent_scale_vector, id_dataset)
+    results['real_psnr'] = real_psnr
+    results['real_ssim'] = real_ssim
+
+    fid = get_fid(decoder.model, latent_scale_vector, id_dataset)
+    results['fid'] = fid
+
+    nll_id_ood_scores = get_nll_ood_scores(encoder.model, decoder.latent_var_trace, id_dataset)
+    rec_id_ood_scores = get_rec_ood_scores(encoder.model, decoder.model, latent_scale_vector, id_dataset)
+    for key in ood_datasets:
+        nll_ood_ood_scores = get_nll_ood_scores(encoder.model, decoder.latent_var_trace, ood_datasets[key])
+        results[key + '_nll_auroc'] = get_auroc(nll_id_ood_scores, nll_ood_ood_scores)
+        rec_ood_ood_scores = get_rec_ood_scores(encoder.model, decoder.model, latent_scale_vector, ood_datasets[key])
+        results[key + '_rec_auroc'] = get_auroc(rec_id_ood_scores, rec_ood_ood_scores)
+
+    return results
+
+
+def evaluate_autoencoder(encoder: Models.Encoder, decoder: Models.Decoder, id_dataset, ood_datasets):
+    results = {}
+
+    real_psnr, real_ssim = evaluate_real_rec(encoder.model, decoder.model, tf.ones([hp.latent_vector_dim]), id_dataset)
+    results['real_psnr'] = real_psnr
+    results['real_ssim'] = real_ssim
+
+    rec_id_ood_scores = get_rec_ood_scores(encoder.model, decoder.model, tf.ones([hp.latent_vector_dim]), id_dataset)
+    for key in ood_datasets:
+        rec_ood_ood_scores = get_rec_ood_scores(encoder.model, decoder.model, tf.ones([hp.latent_vector_dim]), ood_datasets[key])
+        results[key + '_rec_auroc'] = get_auroc(rec_id_ood_scores, rec_ood_ood_scores)
+
+    return results
+
+
+def evaluate_classifier(encoder: Models.Encoder, svm: Models.Svm, id_dataset, ood_datasets):
+    results = {}
+
+    accuracy = get_accuracy(encoder.model, svm.model, id_dataset)
+    results['accuracy'] = accuracy
+
+    id_feature_vectors_set = [encoder.model(data['image'])[1] for data in id_dataset]
+    sorted_id_feature_values = tf.sort(tf.reshape(tf.concat(id_feature_vectors_set, axis=0), [-1]))
+
+    for key in ood_datasets:
+        ood_feature_vectors_set = [encoder.model(data['image'])[1] for data in ood_datasets[key]]
+
+        for react_p in hp.react_ps:
+            activation_threshold = sorted_id_feature_values[round((sorted_id_feature_values.shape[0] - 1) * react_p)]
+
+            for temperature in hp.temperatures:
+                energy_id_ood_scores = get_energy_ood_scores(id_feature_vectors_set, svm.model, temperature, activation_threshold)
+                energy_ood_ood_scores = get_energy_ood_scores(ood_feature_vectors_set, svm.model, temperature, activation_threshold)
+
+                results[key + '_energy_t_' + str(temperature) + '_p_' + str(react_p) + '_auroc'] = get_auroc(energy_id_ood_scores, energy_ood_ood_scores)
+
+    return results
+
+
+def evaluate(encoder: Models.Encoder, decoder: Models.Decoder, svm: Models.Svm, id_dataset, ood_datasets):
+    print(datetime.datetime.now())
+    print('\nevaluating...')
+    start = time.time()
+    if hp.train_gan:
+        results = evaluate_gan(encoder, decoder, id_dataset, ood_datasets)
+    elif hp.train_autoencoder:
+        results = evaluate_autoencoder(encoder, decoder, id_dataset, ood_datasets)
+    elif hp.train_classifier:
+        results = evaluate_classifier(encoder, svm, id_dataset, ood_datasets)
+    else:
+        raise AssertionError
+    for key in results:
+        print('%-50s:' % key, '%13.6f' % results[key])
+    print('evaluate time: ', time.time() - start, '\n')
+    return results

@@ -15,17 +15,17 @@ class Decoder(object):
     def __init__(self):
         self.model = self.build_model()
         self.optimizer = kr.optimizers.Adam(learning_rate=hp.learning_rate, beta_1=0.0, beta_2=0.99)
-        self.latent_var_trace = tf.ones([hp.latent_vector_dim])
+        self.latent_var_trace = tf.Variable(tf.ones([hp.latent_vector_dim]))
 
     def save(self):
-        if not os.path.exists('./models'):
-            os.makedirs('./models')
-        self.model.save_weights('./models/Decoder.h5')
-        np.save('./models/latent_var_trace.npy', self.latent_var_trace)
+        if not os.path.exists('models'):
+            os.makedirs('models')
+        self.model.save_weights('models/decoder.h5')
+        np.save('models/latent_var_trace.npy', self.latent_var_trace)
 
     def load(self):
-        self.model.load_weights('./models/Decoder.h5')
-        self.latent_var_trace = np.load('./models/latent_var_trace.npy')
+        self.model.load_weights('models/decoder.h5')
+        self.latent_var_trace = np.load('models/latent_var_trace.npy')
 
 
 class Encoder(object):
@@ -39,12 +39,12 @@ class Encoder(object):
         self.optimizer = kr.optimizers.Adam(learning_rate=hp.learning_rate, beta_1=0.0, beta_2=0.99)
 
     def save(self):
-        if not os.path.exists('./models'):
-            os.makedirs('./models')
-        self.model.save_weights('./models/Encoder.h5')
+        if not os.path.exists('models'):
+            os.makedirs('models')
+        self.model.save_weights('models/encoder.h5')
 
     def load(self):
-        self.model.load_weights('./models/Encoder.h5')
+        self.model.load_weights('models/encoder.h5')
 
 
 class Svm(object):
@@ -58,9 +58,9 @@ class Svm(object):
         self.optimizer = kr.optimizers.Adam(learning_rate=hp.learning_rate, beta_1=0.0, beta_2=0.99)
 
     def save(self):
-        if not os.path.exists('./models'):
-            os.makedirs('./models')
-        self.model.save_weights('./models/Svm.h5')
+        if not os.path.exists('models'):
+            os.makedirs('models')
+        self.model.save_weights('models/svm.h5')
 
     def load(self):
-        self.model.load_weights('./models/Svm.h5')
+        self.model.load_weights('models/svm.h5')
